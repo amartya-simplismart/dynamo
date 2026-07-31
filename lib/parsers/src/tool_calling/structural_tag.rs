@@ -140,26 +140,16 @@ pub fn gemma4_structural_tag(
             //
             // Set `allow_tool_only_turn` only for a caller that genuinely wants a silent
             // tool turn.
-            // EXCLUSIVE: the envelope OR tool calls, never both in one turn.
-            //
-            // Co-emission (envelope followed by optional tool slots) looks harmless but it
-            // builds a funnel: once the envelope closes, the only continuations the grammar
-            // offers are tool calls or EOS, so the model's "keep going" probability lands on a
-            // tool call. Measured on gemma-4-31B-it with a json_schema present:
-            //
-            //   tools [lookup, end_call]  -> BOTH called, 3/3, on a turn needing neither
-            //   tools [end_call] alone    -> end_call called 3/3 on "things are going okay"
-            //   same tools, NO schema     -> no tool calls at all, 3/3
-            //
-            // i.e. the schema itself was driving tool emission, and a spurious `end_call`
-            // hangs up a live call. With the branches exclusive, nothing follows the envelope,
-            // so a spurious call after it is unsamplable. A tool turn is then tool-only and the
-            // envelope arrives on the follow-up request, which the runtime already handles.
-            let _ = &mut elements;
-            json!({
-                "type": "or",
-                "elements": [elements[0].clone(), gemma4_tool_calls(tool_names, true)],
-            })
+            if allow_tool_only_turn {
+                let with_tools = json!({"type": "sequence", "elements": elements});
+                json!({
+                    "type": "or",
+                    "elements": [with_tools, gemma4_tool_calls(tool_names, true)],
+                })
+            } else {
+                elements[1] = gemma4_tool_calls(tool_names, false);
+                json!({"type": "sequence", "elements": elements})
+            }
         }
         // No content constraint to preserve: the native tag alone is enough, and
         // it is still needed so a forced choice is not pushed into the generic
@@ -272,16 +262,15 @@ mod tests {
     }
 
     #[test]
-    fn schema_and_tools_are_mutually_exclusive() {
-        // The envelope OR tool calls, never both. Co-emission funnels the model into a tool
-        // call after the envelope closes (measured: a spurious end_call on a benign turn), so
-        // nothing may follow the envelope.
+    fn schema_and_tools_require_the_envelope_by_default() {
+        // Envelope first, tool slots after: a tool-only turn is silence for a json_schema
+        // caller, so it is not offered unless the caller asks for it.
         let tag =
             gemma4_structural_tag(&names(), Some(&schema()), false, false, false, false).unwrap();
         assert_eq!(tag["type"], "structural_tag");
-        assert_eq!(tag["format"]["type"], "or");
+        assert_eq!(tag["format"]["type"], "sequence");
         assert_eq!(tag["format"]["elements"][0]["type"], "json_schema");
-        assert_eq!(tag["format"]["elements"][1]["type"], "or"); // per-tool branches
+        assert_eq!(tag["format"]["elements"][1]["type"], "sequence");
         assert_no_repeatable_branch(&tag);
     }
 
@@ -295,19 +284,15 @@ mod tests {
 
     #[test]
     fn distinct_tools_each_get_their_own_slot() {
-        // transfer + hangup in one turn must stay expressible: within the tool branch there is
-        // one slot per tool, so N distinct calls are legal while a repeat of any one is not.
+        // transfer + hangup in one turn must stay expressible: one optional slot per tool,
+        // so N distinct calls are legal while a repeat of any single tool is not.
         let tag = gemma4_structural_tag(&names(), Some(&schema()), false, false, false, false).unwrap();
-        let branch0 = &tag["format"]["elements"][1]["elements"][0];
-        let slots = branch0["elements"].as_array().unwrap();
+        let slots = tag["format"]["elements"][1]["elements"].as_array().unwrap();
         assert_eq!(slots.len(), names().len());
-        // branch 0 requires the first tool and leaves the rest optional
-        assert_eq!(slots[0]["begin"], format!("{GEMMA4_TOOL_CALL_BEGIN}{}", names()[0]));
-        assert_eq!(slots[1]["type"], "optional");
-        assert_eq!(
-            slots[1]["content"]["begin"],
-            format!("{GEMMA4_TOOL_CALL_BEGIN}{}", names()[1])
-        );
+        for (slot, name) in slots.iter().zip(names()) {
+            assert_eq!(slot["type"], "optional");
+            assert_eq!(slot["content"]["begin"], format!("{GEMMA4_TOOL_CALL_BEGIN}{name}"));
+        }
     }
 
     #[test]

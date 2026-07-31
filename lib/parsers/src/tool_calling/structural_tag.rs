@@ -88,6 +88,19 @@ fn gemma4_tool_calls(tool_names: &[String], at_least_one: bool) -> Value {
     }
 }
 
+/// Exactly one tool call, chosen from the offered tools. `stop_after_first` is what makes the
+/// second `<|tool_call>` unsamplable, so neither a repetition loop nor an unrequested extra tool
+/// can follow the first call.
+fn gemma4_single_tool_call(tool_names: &[String]) -> Value {
+    json!({
+        "type": "tags_with_separator",
+        "tags": tool_names.iter().map(|n| gemma4_tool_tag(n)).collect::<Vec<_>>(),
+        "separator": "",
+        "at_least_one": true,
+        "stop_after_first": true,
+    })
+}
+
 /// Build the Gemma 4 tool-call structural tag.
 ///
 /// * `tool_names` — tools the model may call. Empty returns `None`.
@@ -129,7 +142,18 @@ pub fn gemma4_structural_tag(
                 "style": "json",
             });
             // Optional slots, so this one branch already covers "envelope alone".
-            let mut elements = vec![content, gemma4_tool_calls(tool_names, false)];
+            // AT MOST one tool call per turn: `optional` around a `stop_after_first` branch.
+            //
+            // Both halves matter and each was got wrong once. Without `stop_after_first` the
+            // model fills every available slot (it appended end_call to ordinary turns 32
+            // times in 4 conversations). Without the `optional` wrapper the tool call becomes
+            // MANDATORY -- `at_least_one` inside a bare `sequence` means the grammar cannot
+            // finish the turn until a tool has been called, so the model called one on 100% of
+            // turns, including `end_call` on a silence check. A speech turn must be able to end
+            // at the envelope.
+            let optional_call =
+                json!({"type": "optional", "content": gemma4_single_tool_call(tool_names)});
+            let mut elements = vec![content, optional_call.clone()];
 
             // A tool-only turn carries no envelope, and for a json_schema caller the envelope
             // *is* what gets spoken — so that shape is silence. Measured on the stress matrix:
@@ -144,17 +168,17 @@ pub fn gemma4_structural_tag(
                 let with_tools = json!({"type": "sequence", "elements": elements});
                 json!({
                     "type": "or",
-                    "elements": [with_tools, gemma4_tool_calls(tool_names, true)],
+                    "elements": [with_tools, gemma4_single_tool_call(tool_names)],
                 })
             } else {
-                elements[1] = gemma4_tool_calls(tool_names, false);
+                elements[1] = optional_call;
                 json!({"type": "sequence", "elements": elements})
             }
         }
         // No content constraint to preserve: the native tag alone is enough, and
         // it is still needed so a forced choice is not pushed into the generic
         // JSON tool-call shape that Gemma 4 does not speak.
-        None => gemma4_tool_calls(tool_names, true),
+        None => gemma4_single_tool_call(tool_names),
     };
 
     if !allow_reasoning {
@@ -253,12 +277,14 @@ mod tests {
     /// gone — that combination is what makes repetition unrepresentable rather than merely
     /// discouraged, so assert it structurally instead of trusting a flag.
     fn assert_no_repeatable_branch(tag: &Value) {
+        // Every tool branch must be pinned to a single call, so no branch can repeat a tool.
         let dumped = serde_json::to_string(tag).unwrap();
-        assert!(
-            !dumped.contains("tags_with_separator"),
-            "tags_with_separator can express 'one or more' and must not appear: {dumped}"
-        );
-        assert!(!dumped.contains("stop_after_first"), "stale flag: {dumped}");
+        for (i, _) in dumped.match_indices("tags_with_separator") {
+            assert!(
+                dumped[i..].contains("\"stop_after_first\":true"),
+                "a repeatable tool branch survived: {dumped}"
+            );
+        }
     }
 
     #[test]
@@ -270,8 +296,11 @@ mod tests {
         assert_eq!(tag["type"], "structural_tag");
         assert_eq!(tag["format"]["type"], "sequence");
         assert_eq!(tag["format"]["elements"][0]["type"], "json_schema");
-        assert_eq!(tag["format"]["elements"][1]["type"], "sequence");
-        assert_no_repeatable_branch(&tag);
+        // at most one call: optional wrapper (so a speech turn can stop) around a
+        // stop_after_first branch (so a second call is unsamplable)
+        assert_eq!(tag["format"]["elements"][1]["type"], "optional");
+        assert_eq!(tag["format"]["elements"][1]["content"]["type"], "tags_with_separator");
+        assert_eq!(tag["format"]["elements"][1]["content"]["stop_after_first"], true);
     }
 
     #[test]
@@ -283,15 +312,15 @@ mod tests {
     }
 
     #[test]
-    fn distinct_tools_each_get_their_own_slot() {
-        // transfer + hangup in one turn must stay expressible: one optional slot per tool,
-        // so N distinct calls are legal while a repeat of any single tool is not.
+    fn every_offered_tool_is_reachable_as_the_one_call() {
+        // Any offered tool may be THE call for the turn, and only one call is possible.
         let tag = gemma4_structural_tag(&names(), Some(&schema()), false, false, false, false).unwrap();
-        let slots = tag["format"]["elements"][1]["elements"].as_array().unwrap();
-        assert_eq!(slots.len(), names().len());
-        for (slot, name) in slots.iter().zip(names()) {
-            assert_eq!(slot["type"], "optional");
-            assert_eq!(slot["content"]["begin"], format!("{GEMMA4_TOOL_CALL_BEGIN}{name}"));
+        let branch = &tag["format"]["elements"][1]["content"];
+        assert_eq!(branch["stop_after_first"], true);
+        let tags = branch["tags"].as_array().unwrap();
+        assert_eq!(tags.len(), names().len());
+        for (t, name) in tags.iter().zip(names()) {
+            assert_eq!(t["begin"], format!("{GEMMA4_TOOL_CALL_BEGIN}{name}"));
         }
     }
 
@@ -302,16 +331,15 @@ mod tests {
         // cannot mask, leaving the demanded call unmade. Forced choice therefore admits
         // tool calls only — which is also what response_format means in OpenAI's API.
         let tag = gemma4_structural_tag(&names(), Some(&schema()), true, false, false, false).unwrap();
-        // tool calls only, and at least one of them: an `or` of per-tool branches
-        assert_eq!(tag["format"]["type"], "or");
-        assert_no_repeatable_branch(&tag);
+        // tool calls only, pinned to exactly one
+        assert_eq!(tag["format"]["type"], "tags_with_separator");
+        assert_eq!(tag["format"]["stop_after_first"], true);
     }
 
     #[test]
     fn without_schema_the_native_tag_is_used_alone() {
         let tag = gemma4_structural_tag(&names(), None, true, false, false, false).unwrap();
-        assert_eq!(tag["format"]["type"], "or");
-        assert_no_repeatable_branch(&tag);
+        assert_eq!(tag["format"]["type"], "tags_with_separator");
     }
 
     #[test]
@@ -330,7 +358,7 @@ mod tests {
         let tag = gemma4_structural_tag(&names(), None, false, false, false, false).unwrap();
         // no schema -> tool calls only, as an `or` of per-tool branches; branch 0 starts with
         // the first tool required.
-        let first = &tag["format"]["elements"][0]["elements"][0];
+        let first = &tag["format"]["tags"][0];
         assert_eq!(first["begin"], "<|tool_call>call:fetch_seller_details");
         assert_eq!(first["content"]["type"], "any_text");
         assert_eq!(first["end"], GEMMA4_TOOL_CALL_END);

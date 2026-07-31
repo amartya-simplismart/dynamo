@@ -2149,11 +2149,11 @@ impl OpenAIPreprocessor {
             crate::preprocessor::prompt::thinking_bool_from_args(request.chat_template_args())
                 .unwrap_or(true);
 
-        // `parallel_tool_calls` is not surfaced on OAIChatLikeRequest, and the safe default is
-        // a single call: a repeatable tool-call branch is what let the follow-up turn emit the
-        // same call 31-62 times until max_tokens. Thread the request value through here if the
-        // trait ever exposes it.
-        let allow_parallel_calls = false;
+        // Whether a turn may be tool calls with NO envelope. Off: for a json_schema caller the
+        // envelope is the thing that gets spoken, so a tool-only turn is silence on the wire —
+        // measured as lost holding lines / silent transfers / abrupt hangups. Repetition is
+        // impossible either way now, so this is not about how many calls a turn may carry.
+        let allow_tool_only_turn = false;
 
         // Whether the prompt was left inside an open thought channel. Not knowable from the
         // request today, and assuming it is what erased the schema guarantee on the follow-up
@@ -2166,7 +2166,7 @@ impl OpenAIPreprocessor {
             content_schema.as_ref(),
             tools_mandatory,
             allow_reasoning,
-            allow_parallel_calls,
+            allow_tool_only_turn,
             prompt_opened_thought,
         ) else {
             return;

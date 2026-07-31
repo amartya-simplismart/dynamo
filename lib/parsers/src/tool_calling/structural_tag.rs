@@ -30,31 +30,62 @@ pub const GEMMA4_TOOL_CALL_TRIGGER: &str = "<|tool_call>";
 pub const GEMMA4_REASONING_END: &str = "<channel|>";
 pub const GEMMA4_THOUGHT_BEGIN: &str = "<|channel>thought\n";
 
-/// Tool-call branch: one tag per tool, at least one call, body unconstrained.
+fn gemma4_tool_tag(name: &str) -> Value {
+    json!({
+        "type": "tag",
+        "begin": format!("{GEMMA4_TOOL_CALL_BEGIN}{name}"),
+        "content": {"type": "any_text", "excludes": []},
+        "end": GEMMA4_TOOL_CALL_END,
+    })
+}
+
+/// Tool-call branch: one **optional slot per tool**, so every tool may appear at most once.
 ///
-/// `tags_with_separator` admits nothing but tool calls, so a forced choice cannot be
-/// satisfied by prose. `triggered_tags` is equivalent here (both reject free text) but
-/// reads as "text until a trigger", which is not the intent.
-fn gemma4_tool_calls(tool_names: &[String], stop_after_first: bool) -> Value {
-    let tags: Vec<Value> = tool_names
-        .iter()
-        .map(|name| {
-            json!({
-                "type": "tag",
-                "begin": format!("{GEMMA4_TOOL_CALL_BEGIN}{name}"),
-                "content": {"type": "any_text", "excludes": []},
-                "end": GEMMA4_TOOL_CALL_END,
-            })
+/// The repetition loop and a multi-tool turn are different shapes and must not be conflated:
+///
+/// ```text
+/// loop       = the SAME tool 26-62x until finish_reason=length   -> must be impossible
+/// multi-tool = DISTINCT tools, once each (transfer + hangup)     -> must be possible
+/// ```
+///
+/// `tags_with_separator` cannot express that. Without `stop_after_first` it means "one or
+/// more", so 50 identical calls are an accepting string and a second `<|tool_call>` stays a
+/// reachable prefix — the production loop. With `stop_after_first` the second call is banned
+/// outright, which also makes `transfer_to_agent` + `end_call` in one turn unsamplable, and
+/// that is a required behaviour. A sequence of optionals is exactly the right language: no
+/// tool can repeat, any subset of distinct tools is legal.
+///
+/// `at_least_one == false` also matches the empty string, which is correct *after* an envelope
+/// (the envelope alone is a complete turn). As a standalone branch that would make empty
+/// output — dead air — legal, so that case is built as one alternative per tool with that
+/// tool's slot mandatory.
+///
+/// Caveat: the slots are ordered, so calls arrive in the order the tools were declared in the
+/// request. The caller controls that order; permuting would cost one branch per ordering.
+fn gemma4_tool_calls(tool_names: &[String], at_least_one: bool) -> Value {
+    let optional = |name: &String| json!({"type": "optional", "content": gemma4_tool_tag(name)});
+
+    if !at_least_one {
+        return json!({
+            "type": "sequence",
+            "elements": tool_names.iter().map(optional).collect::<Vec<_>>(),
+        });
+    }
+
+    let branches: Vec<Value> = (0..tool_names.len())
+        .map(|i| {
+            let mut elements: Vec<Value> = tool_names[..i].iter().map(optional).collect();
+            elements.push(gemma4_tool_tag(&tool_names[i])); // required => branch is non-empty
+            elements.extend(tool_names[i + 1..].iter().map(optional));
+            json!({"type": "sequence", "elements": elements})
         })
         .collect();
 
-    json!({
-        "type": "tags_with_separator",
-        "tags": tags,
-        "separator": "",
-        "at_least_one": true,
-        "stop_after_first": stop_after_first,
-    })
+    if branches.len() == 1 {
+        branches.into_iter().next().unwrap()
+    } else {
+        json!({"type": "or", "elements": branches})
+    }
 }
 
 /// Build the Gemma 4 tool-call structural tag.
@@ -65,8 +96,10 @@ fn gemma4_tool_calls(tool_names: &[String], stop_after_first: bool) -> Value {
 /// * `tools_mandatory` — `true` for `tool_choice: "required"` or a named choice:
 ///   a message may precede a call but must not stand alone.
 /// * `allow_reasoning` — permit an optional leading thinking block.
-/// * `allow_parallel_calls` — permit more than one call in a single response. Off unless
-///   the caller opted in; see the repetition note below.
+/// * `allow_tool_only_turn` — permit a turn that is tool calls with **no** envelope. Off by
+///   default: for a `json_schema` caller the envelope is what gets spoken, so a tool-only turn
+///   is silence on the wire. Repetition is impossible either way (see `gemma4_tool_calls`), so
+///   this is no longer about how many calls a turn may carry.
 /// * `prompt_opened_thought` — the chat template left the prompt inside an open thought
 ///   channel, so the completion emits only the closer. Off unless known; see below.
 pub fn gemma4_structural_tag(
@@ -74,27 +107,12 @@ pub fn gemma4_structural_tag(
     content_schema: Option<&Value>,
     tools_mandatory: bool,
     allow_reasoning: bool,
-    allow_parallel_calls: bool,
+    allow_tool_only_turn: bool,
     prompt_opened_thought: bool,
 ) -> Option<Value> {
     if tool_names.is_empty() {
         return None;
     }
-
-    // Repetition must be off by default, forced or not. `tags_with_separator` with
-    // `at_least_one` and no `stop_after_first` means "one or more", so N back-to-back calls
-    // are all accepting strings and a second `<|tool_call>` stays a reachable prefix the
-    // moment the first call closes. Nothing then pushes the model to stop: measured on
-    // gemma-4-31B-it, `required` emitted the same call 28 times until max_tokens, and in a
-    // multi-turn conversation the *unforced* tool follow-up did the same 31-62 times
-    // (finish_reason=length, i.e. a dead turn).
-    //
-    // Leaving it on for unforced turns "in case a model batches calls" trades a rare
-    // convenience for a reproducible hang, and no client can undo it after the fact —
-    // raising max_tokens only buys more duplicates. So repetition is opt-in via
-    // `allow_parallel_calls`, which is what OpenAI's `parallel_tool_calls` means.
-    let stop_after_first = tools_mandatory || !allow_parallel_calls;
-    let tool_calls = gemma4_tool_calls(tool_names, stop_after_first);
 
     // A forced tool choice must not offer a content branch. The schema object is a legal
     // *prefix* of "content then tool call", so the model writes it and then ends the turn
@@ -110,19 +128,33 @@ pub fn gemma4_structural_tag(
                 "json_schema": schema,
                 "style": "json",
             });
-            let after_content = json!({"type": "optional", "content": tool_calls.clone()});
-            json!({
-                "type": "or",
-                "elements": [
-                    {"type": "sequence", "elements": [content, after_content]},
-                    tool_calls,
-                ],
-            })
+            // Optional slots, so this one branch already covers "envelope alone".
+            let mut elements = vec![content, gemma4_tool_calls(tool_names, false)];
+
+            // A tool-only turn carries no envelope, and for a json_schema caller the envelope
+            // *is* what gets spoken — so that shape is silence. Measured on the stress matrix:
+            // with the tool-only branch available the model took it on every co-emission turn
+            // (holding line, end_call, transfer), losing the spoken line each time even though
+            // envelope+tool was permitted. Offering it makes the envelope a preference the
+            // model can decline; withholding it makes the envelope structural.
+            //
+            // Set `allow_tool_only_turn` only for a caller that genuinely wants a silent
+            // tool turn.
+            if allow_tool_only_turn {
+                let with_tools = json!({"type": "sequence", "elements": elements});
+                json!({
+                    "type": "or",
+                    "elements": [with_tools, gemma4_tool_calls(tool_names, true)],
+                })
+            } else {
+                elements[1] = gemma4_tool_calls(tool_names, false);
+                json!({"type": "sequence", "elements": elements})
+            }
         }
         // No content constraint to preserve: the native tag alone is enough, and
         // it is still needed so a forced choice is not pushed into the generic
         // JSON tool-call shape that Gemma 4 does not speak.
-        None => tool_calls,
+        None => gemma4_tool_calls(tool_names, true),
     };
 
     if !allow_reasoning {
@@ -180,7 +212,7 @@ pub fn structural_tag_for_parser(
     content_schema: Option<&Value>,
     tools_mandatory: bool,
     allow_reasoning: bool,
-    allow_parallel_calls: bool,
+    allow_tool_only_turn: bool,
     prompt_opened_thought: bool,
 ) -> Option<Value> {
     if !parser_has_structural_tag(parser) {
@@ -191,7 +223,7 @@ pub fn structural_tag_for_parser(
         content_schema,
         tools_mandatory,
         allow_reasoning,
-        allow_parallel_calls,
+        allow_tool_only_turn,
         prompt_opened_thought,
     )
 }
@@ -217,14 +249,50 @@ mod tests {
         assert!(gemma4_structural_tag(&[], Some(&schema()), false, true, false, false).is_none());
     }
 
+    /// Every tool slot is an `optional` wrapping a single `tag`, and `tags_with_separator` is
+    /// gone — that combination is what makes repetition unrepresentable rather than merely
+    /// discouraged, so assert it structurally instead of trusting a flag.
+    fn assert_no_repeatable_branch(tag: &Value) {
+        let dumped = serde_json::to_string(tag).unwrap();
+        assert!(
+            !dumped.contains("tags_with_separator"),
+            "tags_with_separator can express 'one or more' and must not appear: {dumped}"
+        );
+        assert!(!dumped.contains("stop_after_first"), "stale flag: {dumped}");
+    }
+
     #[test]
-    fn schema_and_tools_produce_a_union() {
-        let tag = gemma4_structural_tag(&names(), Some(&schema()), false, false, false, false).unwrap();
+    fn schema_and_tools_require_the_envelope_by_default() {
+        // Envelope first, tool slots after: a tool-only turn is silence for a json_schema
+        // caller, so it is not offered unless the caller asks for it.
+        let tag =
+            gemma4_structural_tag(&names(), Some(&schema()), false, false, false, false).unwrap();
         assert_eq!(tag["type"], "structural_tag");
+        assert_eq!(tag["format"]["type"], "sequence");
+        assert_eq!(tag["format"]["elements"][0]["type"], "json_schema");
+        assert_eq!(tag["format"]["elements"][1]["type"], "sequence");
+        assert_no_repeatable_branch(&tag);
+    }
+
+    #[test]
+    fn a_tool_only_turn_is_opt_in() {
+        let tag =
+            gemma4_structural_tag(&names(), Some(&schema()), false, false, true, false).unwrap();
         assert_eq!(tag["format"]["type"], "or");
-        // branch 0: content then optional tool calls; branch 1: tool calls alone
-        assert_eq!(tag["format"]["elements"][0]["elements"][1]["type"], "optional");
-        assert_eq!(tag["format"]["elements"][1]["type"], "tags_with_separator");
+        assert_no_repeatable_branch(&tag);
+    }
+
+    #[test]
+    fn distinct_tools_each_get_their_own_slot() {
+        // transfer + hangup in one turn must stay expressible: one optional slot per tool,
+        // so N distinct calls are legal while a repeat of any single tool is not.
+        let tag = gemma4_structural_tag(&names(), Some(&schema()), false, false, false, false).unwrap();
+        let slots = tag["format"]["elements"][1]["elements"].as_array().unwrap();
+        assert_eq!(slots.len(), names().len());
+        for (slot, name) in slots.iter().zip(names()) {
+            assert_eq!(slot["type"], "optional");
+            assert_eq!(slot["content"]["begin"], format!("{GEMMA4_TOOL_CALL_BEGIN}{name}"));
+        }
     }
 
     #[test]
@@ -234,14 +302,16 @@ mod tests {
         // cannot mask, leaving the demanded call unmade. Forced choice therefore admits
         // tool calls only — which is also what response_format means in OpenAI's API.
         let tag = gemma4_structural_tag(&names(), Some(&schema()), true, false, false, false).unwrap();
-        assert_eq!(tag["format"]["type"], "tags_with_separator");
-        assert_eq!(tag["format"]["at_least_one"], true);
+        // tool calls only, and at least one of them: an `or` of per-tool branches
+        assert_eq!(tag["format"]["type"], "or");
+        assert_no_repeatable_branch(&tag);
     }
 
     #[test]
     fn without_schema_the_native_tag_is_used_alone() {
         let tag = gemma4_structural_tag(&names(), None, true, false, false, false).unwrap();
-        assert_eq!(tag["format"]["type"], "tags_with_separator");
+        assert_eq!(tag["format"]["type"], "or");
+        assert_no_repeatable_branch(&tag);
     }
 
     #[test]
@@ -258,10 +328,12 @@ mod tests {
     #[test]
     fn tool_names_are_constrained_but_arguments_are_not() {
         let tag = gemma4_structural_tag(&names(), None, false, false, false, false).unwrap();
-        let tags = &tag["format"]["tags"];
-        assert_eq!(tags[0]["begin"], "<|tool_call>call:fetch_seller_details");
-        assert_eq!(tags[0]["content"]["type"], "any_text");
-        assert_eq!(tags[0]["end"], GEMMA4_TOOL_CALL_END);
+        // no schema -> tool calls only, as an `or` of per-tool branches; branch 0 starts with
+        // the first tool required.
+        let first = &tag["format"]["elements"][0]["elements"][0];
+        assert_eq!(first["begin"], "<|tool_call>call:fetch_seller_details");
+        assert_eq!(first["content"]["type"], "any_text");
+        assert_eq!(first["end"], GEMMA4_TOOL_CALL_END);
     }
 
     #[test]
@@ -289,26 +361,21 @@ mod tests {
     }
 
     #[test]
-    fn repetition_is_off_unless_opted_into() {
-        // The production loop: the same call 31-62x until finish_reason=length. A repeatable
-        // branch makes that an accepting string, so it must not be the default on any path.
-        let forced = gemma4_structural_tag(&names(), None, true, false, false, false).unwrap();
-        assert_eq!(forced["format"]["stop_after_first"], true);
-
-        // the tool-only branch of the union, unforced — the turn that loops in production
-        let auto =
-            gemma4_structural_tag(&names(), Some(&schema()), false, false, false, false).unwrap();
-        assert_eq!(auto["format"]["elements"][1]["stop_after_first"], true);
-        // and the branch reachable after the content object
-        assert_eq!(
-            auto["format"]["elements"][0]["elements"][1]["content"]["stop_after_first"],
-            true
-        );
-
-        // opting in restores batching for callers that genuinely want parallel calls
-        let parallel =
-            gemma4_structural_tag(&names(), Some(&schema()), false, false, true, false).unwrap();
-        assert_eq!(parallel["format"]["elements"][1]["stop_after_first"], false);
+    fn repetition_is_unrepresentable_on_every_path() {
+        // The production loop is the SAME tool 26-62x until finish_reason=length. With one
+        // optional slot per tool there is no branch that can emit a tool twice, forced or not,
+        // with or without a schema, tool-only offered or not.
+        for mandatory in [true, false] {
+            for tool_only in [true, false] {
+                for sch in [Some(schema()), None] {
+                    let tag = gemma4_structural_tag(
+                        &names(), sch.as_ref(), mandatory, false, tool_only, false,
+                    )
+                    .unwrap();
+                    assert_no_repeatable_branch(&tag);
+                }
+            }
+        }
     }
 
     #[test]

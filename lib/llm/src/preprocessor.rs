@@ -2167,22 +2167,50 @@ impl OpenAIPreprocessor {
         // change), but already say the same thing in-band: the turn's own system/developer
         // message instructs the model to call two tools together ("call X AND Y in the same
         // turn"). That instruction is content the server already has to parse to run the turn
-        // at all, so honouring it is not a new signal, just reading the one that is there. It
-        // is intentionally a narrow pattern (requires "AND" and "same turn" together) so it
-        // does not fire on ordinary guidance text -- verified against the multi-turn repro's
-        // own reminders, which do not match and stay on the single-call default.
+        // at all, so honouring it is not a new signal, just reading the one that is there.
+        //
+        // This is a heuristic, not a structured field, so it is deliberately narrowed on two
+        // axes rather than one, because the two failure directions are not symmetric: missing
+        // a real multi-tool instruction just falls back to the (already safe) single-call
+        // default, but a false positive re-opens the exact regression this grammar exists to
+        // prevent -- a tool fired on a turn that did not need it.
+        //
+        //   1. SCOPED TO THIS TURN. Only the trailing system/developer messages -- the ones
+        //      appended after the last user message -- are read. Scanning the whole history
+        //      would let one multi-tool instruction anywhere in a long conversation stay
+        //      "latched on" for every later turn, which is not what the instruction means and
+        //      is exactly the kind of over-broad tool offering that causes the misuse this is
+        //      meant to avoid. Without a user-message boundary the turn cannot be scoped, so
+        //      the heuristic does not fire at all rather than falling back to scanning
+        //      everything.
+        //   2. ANCHORED TO A REAL TOOL. The message must name one of THIS request's own
+        //      offered tools, not just contain generic phrasing ("and", "same turn"). Tool
+        //      names are code identifiers, not English words, so an arbitrary reminder or
+        //      caller message cannot coincidentally satisfy this the way it could a phrase
+        //      alone -- checked against the multi-turn repro's own reminders and guidance
+        //      text, none of which name a tool, so none match.
         let requests_parallel_in_message = to_json(Some(request.messages()))
             .and_then(|m| m.as_array().cloned())
-            .map(|messages| {
-                messages.iter().any(|m| {
-                    let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                    if role != "system" && role != "developer" {
-                        return false;
-                    }
-                    let text = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    let lower = text.to_lowercase();
-                    lower.contains(" and ") && lower.contains("same turn")
-                })
+            .and_then(|messages| {
+                let last_user = messages.iter().rposition(|m| {
+                    m.get("role").and_then(|r| r.as_str()) == Some("user")
+                })?;
+                Some(
+                    messages[last_user + 1..]
+                        .iter()
+                        .filter(|m| {
+                            matches!(
+                                m.get("role").and_then(|r| r.as_str()),
+                                Some("system") | Some("developer")
+                            )
+                        })
+                        .any(|m| {
+                            let text = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                            let lower = text.to_lowercase();
+                            lower.contains("same turn")
+                                && selected.iter().any(|name| text.contains(name.as_str()))
+                        }),
+                )
             })
             .unwrap_or(false);
 

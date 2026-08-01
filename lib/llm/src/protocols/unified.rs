@@ -479,6 +479,10 @@ impl OAIChatLikeRequest for UnifiedRequest {
         OAIChatLikeRequest::response_format(&self.inner)
     }
 
+    fn parallel_tool_calls(&self) -> Option<bool> {
+        OAIChatLikeRequest::parallel_tool_calls(&self.inner)
+    }
+
     fn should_add_generation_prompt(&self) -> bool {
         OAIChatLikeRequest::should_add_generation_prompt(&self.inner)
     }

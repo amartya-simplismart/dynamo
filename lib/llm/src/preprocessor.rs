@@ -2155,6 +2155,17 @@ impl OpenAIPreprocessor {
         // impossible either way now, so this is not about how many calls a turn may carry.
         let allow_tool_only_turn = false;
 
+        // A multi-tool turn (transfer_to_agent + end_call in one response) needs two distinct
+        // calls, which per-tool slots make expressible -- but offering every tool as an
+        // independently-fillable slot measurably increases how often the model calls one it did
+        // not need, including a call-ending tool mid-conversation (measured with a terminal-tool
+        // policy in the chat template active too: 15/15 conversations broken, 96 turns of
+        // misuse, vs. 0 with a single call). So it is reachable only when the caller explicitly
+        // asks for it via `parallel_tool_calls`, mirroring OpenAI semantics -- never inferred
+        // from the tool list, and `None` (no preference stated) keeps the safe single-call
+        // default.
+        let allow_parallel_calls = request.parallel_tool_calls().unwrap_or(false);
+
         // Whether the prompt was left inside an open thought channel. Not knowable from the
         // request today, and assuming it is what erased the schema guarantee on the follow-up
         // turn, so it stays off until a real signal exists.
@@ -2167,6 +2178,7 @@ impl OpenAIPreprocessor {
             tools_mandatory,
             allow_reasoning,
             allow_tool_only_turn,
+            allow_parallel_calls,
             prompt_opened_thought,
         ) else {
             return;

@@ -113,6 +113,12 @@ fn gemma4_single_tool_call(tool_names: &[String]) -> Value {
 ///   default: for a `json_schema` caller the envelope is what gets spoken, so a tool-only turn
 ///   is silence on the wire. Repetition is impossible either way (see `gemma4_tool_calls`), so
 ///   this is no longer about how many calls a turn may carry.
+/// * `allow_parallel_calls` — permit more than one DISTINCT tool call in the same turn (e.g.
+///   `transfer_to_agent` + `end_call`). Off by default and pinned to a single call, because
+///   offering every tool as an independently-fillable slot measurably increases how often the
+///   model calls one it did not need — including a call-ending tool mid-conversation. Turning
+///   this on is an explicit request from the caller (mirrors OpenAI's `parallel_tool_calls`);
+///   it is not inferred from the tool list. Still no repetition of the SAME tool either way.
 /// * `prompt_opened_thought` — the chat template left the prompt inside an open thought
 ///   channel, so the completion emits only the closer. Off unless known; see below.
 pub fn gemma4_structural_tag(
@@ -121,6 +127,7 @@ pub fn gemma4_structural_tag(
     tools_mandatory: bool,
     allow_reasoning: bool,
     allow_tool_only_turn: bool,
+    allow_parallel_calls: bool,
     prompt_opened_thought: bool,
 ) -> Option<Value> {
     if tool_names.is_empty() {
@@ -134,6 +141,31 @@ pub fn gemma4_structural_tag(
     // choice produces a tool call rather than content.
     let content_schema = if tools_mandatory { None } else { content_schema };
 
+    // AT MOST one tool call per turn, unless the caller explicitly asked for parallel calls.
+    //
+    // Both halves of the single-call form matter and each was got wrong once. Without
+    // `stop_after_first` the model fills every available slot (it appended end_call to ordinary
+    // turns 32 times in 4 conversations). Without the `optional` wrapper the tool call becomes
+    // MANDATORY -- `at_least_one` inside a bare `sequence` means the grammar cannot finish the
+    // turn until a tool has been called, so the model called one on 100% of turns, including
+    // `end_call` on a silence check. A speech turn must be able to end at the envelope.
+    //
+    // The per-tool-slots form (`gemma4_tool_calls(names, at_least_one)`) is what makes a
+    // multi-tool turn (transfer_to_agent + end_call) expressible, but it reintroduces the same
+    // over-calling measured above -- confirmed again with a terminal-tool policy in the chat
+    // template active, which was not enough to make slots safe by default. So it is reachable
+    // only via `allow_parallel_calls`, an explicit signal from the caller, not inferred from the
+    // tool list or the schema.
+    let one_tool_call = |at_least_one: bool| {
+        if allow_parallel_calls {
+            gemma4_tool_calls(tool_names, at_least_one)
+        } else if at_least_one {
+            gemma4_single_tool_call(tool_names)
+        } else {
+            json!({"type": "optional", "content": gemma4_single_tool_call(tool_names)})
+        }
+    };
+
     let body = match content_schema {
         Some(schema) => {
             let content = json!({
@@ -141,19 +173,10 @@ pub fn gemma4_structural_tag(
                 "json_schema": schema,
                 "style": "json",
             });
-            // Optional slots, so this one branch already covers "envelope alone".
-            // AT MOST one tool call per turn: `optional` around a `stop_after_first` branch.
-            //
-            // Both halves matter and each was got wrong once. Without `stop_after_first` the
-            // model fills every available slot (it appended end_call to ordinary turns 32
-            // times in 4 conversations). Without the `optional` wrapper the tool call becomes
-            // MANDATORY -- `at_least_one` inside a bare `sequence` means the grammar cannot
-            // finish the turn until a tool has been called, so the model called one on 100% of
-            // turns, including `end_call` on a silence check. A speech turn must be able to end
-            // at the envelope.
-            let optional_call =
-                json!({"type": "optional", "content": gemma4_single_tool_call(tool_names)});
-            let mut elements = vec![content, optional_call.clone()];
+            // `one_tool_call(false)` already covers "envelope alone" (all its slots are
+            // optional / it is itself optional), so this one branch is enough unless a silent
+            // tool-only turn must also be offered.
+            let mut elements = vec![content, one_tool_call(false)];
 
             // A tool-only turn carries no envelope, and for a json_schema caller the envelope
             // *is* what gets spoken — so that shape is silence. Measured on the stress matrix:
@@ -168,17 +191,25 @@ pub fn gemma4_structural_tag(
                 let with_tools = json!({"type": "sequence", "elements": elements});
                 json!({
                     "type": "or",
-                    "elements": [with_tools, gemma4_single_tool_call(tool_names)],
+                    "elements": [with_tools, one_tool_call(true)],
                 })
             } else {
-                elements[1] = optional_call;
+                elements[1] = one_tool_call(false);
                 json!({"type": "sequence", "elements": elements})
             }
         }
         // No content constraint to preserve: the native tag alone is enough, and
         // it is still needed so a forced choice is not pushed into the generic
-        // JSON tool-call shape that Gemma 4 does not speak.
-        None => gemma4_single_tool_call(tool_names),
+        // JSON tool-call shape that Gemma 4 does not speak. A forced choice is always pinned to
+        // one call regardless of `allow_parallel_calls` -- OpenAI's `parallel_tool_calls` is
+        // about batching independent calls, not about what a single demanded call may do.
+        None => {
+            if tools_mandatory {
+                gemma4_single_tool_call(tool_names)
+            } else {
+                one_tool_call(true)
+            }
+        }
     };
 
     if !allow_reasoning {
@@ -237,6 +268,7 @@ pub fn structural_tag_for_parser(
     tools_mandatory: bool,
     allow_reasoning: bool,
     allow_tool_only_turn: bool,
+    allow_parallel_calls: bool,
     prompt_opened_thought: bool,
 ) -> Option<Value> {
     if !parser_has_structural_tag(parser) {
@@ -248,6 +280,7 @@ pub fn structural_tag_for_parser(
         tools_mandatory,
         allow_reasoning,
         allow_tool_only_turn,
+        allow_parallel_calls,
         prompt_opened_thought,
     )
 }
@@ -270,7 +303,7 @@ mod tests {
 
     #[test]
     fn no_tools_yields_no_tag() {
-        assert!(gemma4_structural_tag(&[], Some(&schema()), false, true, false, false).is_none());
+        assert!(gemma4_structural_tag(&[], Some(&schema()), false, true, false, false, false).is_none());
     }
 
     /// Every tool slot is an `optional` wrapping a single `tag`, and `tags_with_separator` is
@@ -292,7 +325,7 @@ mod tests {
         // Envelope first, tool slots after: a tool-only turn is silence for a json_schema
         // caller, so it is not offered unless the caller asks for it.
         let tag =
-            gemma4_structural_tag(&names(), Some(&schema()), false, false, false, false).unwrap();
+            gemma4_structural_tag(&names(), Some(&schema()), false, false, false, false, false).unwrap();
         assert_eq!(tag["type"], "structural_tag");
         assert_eq!(tag["format"]["type"], "sequence");
         assert_eq!(tag["format"]["elements"][0]["type"], "json_schema");
@@ -306,7 +339,7 @@ mod tests {
     #[test]
     fn a_tool_only_turn_is_opt_in() {
         let tag =
-            gemma4_structural_tag(&names(), Some(&schema()), false, false, true, false).unwrap();
+            gemma4_structural_tag(&names(), Some(&schema()), false, false, true, false, false).unwrap();
         assert_eq!(tag["format"]["type"], "or");
         assert_no_repeatable_branch(&tag);
     }
@@ -314,7 +347,7 @@ mod tests {
     #[test]
     fn every_offered_tool_is_reachable_as_the_one_call() {
         // Any offered tool may be THE call for the turn, and only one call is possible.
-        let tag = gemma4_structural_tag(&names(), Some(&schema()), false, false, false, false).unwrap();
+        let tag = gemma4_structural_tag(&names(), Some(&schema()), false, false, false, false, false).unwrap();
         let branch = &tag["format"]["elements"][1]["content"];
         assert_eq!(branch["stop_after_first"], true);
         let tags = branch["tags"].as_array().unwrap();
@@ -330,7 +363,7 @@ mod tests {
         // lets the model write content and end the turn with a special token the grammar
         // cannot mask, leaving the demanded call unmade. Forced choice therefore admits
         // tool calls only — which is also what response_format means in OpenAI's API.
-        let tag = gemma4_structural_tag(&names(), Some(&schema()), true, false, false, false).unwrap();
+        let tag = gemma4_structural_tag(&names(), Some(&schema()), true, false, false, false, false).unwrap();
         // tool calls only, pinned to exactly one
         assert_eq!(tag["format"]["type"], "tags_with_separator");
         assert_eq!(tag["format"]["stop_after_first"], true);
@@ -338,13 +371,13 @@ mod tests {
 
     #[test]
     fn without_schema_the_native_tag_is_used_alone() {
-        let tag = gemma4_structural_tag(&names(), None, true, false, false, false).unwrap();
+        let tag = gemma4_structural_tag(&names(), None, true, false, false, false, false).unwrap();
         assert_eq!(tag["format"]["type"], "tags_with_separator");
     }
 
     #[test]
     fn reasoning_prefix_is_optional_and_wraps_the_body() {
-        let tag = gemma4_structural_tag(&names(), None, false, true, false, false).unwrap();
+        let tag = gemma4_structural_tag(&names(), None, false, true, false, false, false).unwrap();
         assert_eq!(tag["format"]["type"], "sequence");
         assert_eq!(tag["format"]["elements"][0]["type"], "optional");
         assert_eq!(
@@ -355,7 +388,7 @@ mod tests {
 
     #[test]
     fn tool_names_are_constrained_but_arguments_are_not() {
-        let tag = gemma4_structural_tag(&names(), None, false, false, false, false).unwrap();
+        let tag = gemma4_structural_tag(&names(), None, false, false, false, false, false).unwrap();
         // no schema -> tool calls only, as an `or` of per-tool branches; branch 0 starts with
         // the first tool required.
         let first = &tag["format"]["tags"][0];
@@ -371,7 +404,7 @@ mod tests {
         // and end the turn. Forced and unforced turns both constrain it.
         for mandatory in [true, false] {
             let tag =
-                gemma4_structural_tag(&names(), None, mandatory, true, false, false).unwrap();
+                gemma4_structural_tag(&names(), None, mandatory, true, false, false, false).unwrap();
             assert_eq!(
                 tag["format"]["elements"][0]["content"]["begin"],
                 GEMMA4_THOUGHT_BEGIN,
@@ -384,7 +417,7 @@ mod tests {
     fn prompt_opened_thought_is_opt_in() {
         // The continuation case is real, but only correct when the prompt genuinely left the
         // channel open — assuming it on every request is what broke the tool follow-up.
-        let tag = gemma4_structural_tag(&names(), None, false, true, false, true).unwrap();
+        let tag = gemma4_structural_tag(&names(), None, false, true, false, false, true).unwrap();
         assert_eq!(tag["format"]["elements"][0]["content"]["begin"], "");
     }
 
@@ -397,7 +430,7 @@ mod tests {
             for tool_only in [true, false] {
                 for sch in [Some(schema()), None] {
                     let tag = gemma4_structural_tag(
-                        &names(), sch.as_ref(), mandatory, false, tool_only, false,
+                        &names(), sch.as_ref(), mandatory, false, tool_only, false, false,
                     )
                     .unwrap();
                     assert_no_repeatable_branch(&tag);
@@ -407,13 +440,47 @@ mod tests {
     }
 
     #[test]
+    fn allow_parallel_calls_is_opt_in_and_still_forbids_repetition() {
+        // Default: pinned to one call, so a multi-tool turn is unreachable.
+        let single = gemma4_structural_tag(
+            &names(), Some(&schema()), false, false, false, false, false,
+        )
+        .unwrap();
+        let dumped = serde_json::to_string(&single).unwrap();
+        assert!(dumped.contains("\"stop_after_first\":true"));
+
+        // Opted in: distinct tools become reachable together...
+        let parallel = gemma4_structural_tag(
+            &names(), Some(&schema()), false, false, false, true, false,
+        )
+        .unwrap();
+        let slots = parallel["format"]["elements"][1]["elements"].as_array().unwrap();
+        assert_eq!(slots.len(), names().len());
+        // ...but the SAME tool still cannot repeat: no tags_with_separator without
+        // stop_after_first, and each tool appears in exactly one optional slot.
+        assert_no_repeatable_branch(&parallel);
+        for (slot, name) in slots.iter().zip(names()) {
+            assert_eq!(slot["type"], "optional");
+            assert_eq!(slot["content"]["begin"], format!("{GEMMA4_TOOL_CALL_BEGIN}{name}"));
+        }
+
+        // A forced choice ignores allow_parallel_calls -- it is still pinned to one call.
+        let forced = gemma4_structural_tag(
+            &names(), Some(&schema()), true, false, false, true, false,
+        )
+        .unwrap();
+        assert_eq!(forced["format"]["type"], "tags_with_separator");
+        assert_eq!(forced["format"]["stop_after_first"], true);
+    }
+
+    #[test]
     fn only_gemma4_has_a_tag() {
         assert!(parser_has_structural_tag(Some("gemma4")));
         assert!(parser_has_structural_tag(Some("gemma-4")));
         assert!(!parser_has_structural_tag(Some("hermes")));
         assert!(!parser_has_structural_tag(None));
         assert!(
-            structural_tag_for_parser(Some("hermes"), &names(), None, false, false, false, false).is_none()
+            structural_tag_for_parser(Some("hermes"), &names(), None, false, false, false, false, false).is_none()
         );
     }
 }

@@ -87,6 +87,13 @@ pub trait OAIChatLikeRequest {
         None
     }
 
+    /// The caller's `parallel_tool_calls`, if sent. `None` when the caller expressed no
+    /// preference, in which case the safe default is a single tool call per turn -- see
+    /// `apply_native_tool_call_constraint` in preprocessor.rs.
+    fn parallel_tool_calls(&self) -> Option<bool> {
+        None
+    }
+
     fn should_add_generation_prompt(&self) -> bool;
 
     /// Optional additional args to merge into the chat template context

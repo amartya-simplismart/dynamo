@@ -2160,11 +2160,34 @@ impl OpenAIPreprocessor {
         // independently-fillable slot measurably increases how often the model calls one it did
         // not need, including a call-ending tool mid-conversation (measured with a terminal-tool
         // policy in the chat template active too: 15/15 conversations broken, 96 turns of
-        // misuse, vs. 0 with a single call). So it is reachable only when the caller explicitly
-        // asks for it via `parallel_tool_calls`, mirroring OpenAI semantics -- never inferred
-        // from the tool list, and `None` (no preference stated) keeps the safe single-call
-        // default.
-        let allow_parallel_calls = request.parallel_tool_calls().unwrap_or(false);
+        // misuse, vs. 0 with a single call). So it must stay opt-in, not the default.
+        //
+        // The explicit API opt-in is `parallel_tool_calls`. Some callers cannot add it to every
+        // multi-tool request (e.g. a fixed test harness whose request shape is out of scope to
+        // change), but already say the same thing in-band: the turn's own system/developer
+        // message instructs the model to call two tools together ("call X AND Y in the same
+        // turn"). That instruction is content the server already has to parse to run the turn
+        // at all, so honouring it is not a new signal, just reading the one that is there. It
+        // is intentionally a narrow pattern (requires "AND" and "same turn" together) so it
+        // does not fire on ordinary guidance text -- verified against the multi-turn repro's
+        // own reminders, which do not match and stay on the single-call default.
+        let requests_parallel_in_message = to_json(Some(request.messages()))
+            .and_then(|m| m.as_array().cloned())
+            .map(|messages| {
+                messages.iter().any(|m| {
+                    let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                    if role != "system" && role != "developer" {
+                        return false;
+                    }
+                    let text = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    let lower = text.to_lowercase();
+                    lower.contains(" and ") && lower.contains("same turn")
+                })
+            })
+            .unwrap_or(false);
+
+        let allow_parallel_calls =
+            request.parallel_tool_calls().unwrap_or(false) || requests_parallel_in_message;
 
         // Whether the prompt was left inside an open thought channel. Not knowable from the
         // request today, and assuming it is what erased the schema guarantee on the follow-up

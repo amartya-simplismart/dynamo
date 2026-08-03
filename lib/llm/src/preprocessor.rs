@@ -2095,8 +2095,8 @@ impl OpenAIPreprocessor {
         let Some(tools) = to_json(request.tools()) else {
             return;
         };
-        let tool_names = Self::tool_names_from_value(&tools);
-        if tool_names.is_empty() {
+        let tool_defs = Self::tool_definitions_from_value(&tools);
+        if tool_defs.is_empty() {
             return;
         }
 
@@ -2114,13 +2114,14 @@ impl OpenAIPreprocessor {
             .map(str::to_string);
         let tools_mandatory = choice_str == Some("required") || named_tool.is_some();
 
-        let selected: Vec<String> = match &named_tool {
-            Some(name) => tool_names.iter().filter(|n| *n == name).cloned().collect(),
-            None => tool_names,
+        let selected_defs: Vec<dynamo_parsers::tool_calling::ToolDefinition> = match &named_tool {
+            Some(name) => tool_defs.into_iter().filter(|t| &t.name == name).collect(),
+            None => tool_defs,
         };
-        if selected.is_empty() {
+        if selected_defs.is_empty() {
             return;
         }
+        let selected: Vec<String> = selected_defs.iter().map(|t| t.name.clone()).collect();
 
         // The content constraint worth keeping: an explicit json_schema, or json_object,
         // which is "any JSON object" and would otherwise fall back to a bare JSON grammar
@@ -2141,12 +2142,96 @@ impl OpenAIPreprocessor {
             return;
         }
 
+        // Gemma 4's chat template opens a thought channel only when `enable_thinking` is
+        // truthy, so when the caller turns it off the grammar must not leave one open either.
+        // The thought branch is `any_text` up to the closer, so allowing it when the model
+        // will never use it only widens what the model may emit instead of the schema object.
+        let allow_reasoning =
+            crate::preprocessor::prompt::thinking_bool_from_args(request.chat_template_args())
+                .unwrap_or(true);
+
+        // Whether a turn may be tool calls with NO envelope. Off: for a json_schema caller the
+        // envelope is the thing that gets spoken, so a tool-only turn is silence on the wire —
+        // measured as lost holding lines / silent transfers / abrupt hangups. Repetition is
+        // impossible either way now, so this is not about how many calls a turn may carry.
+        let allow_tool_only_turn = false;
+
+        // A multi-tool turn (transfer_to_agent + end_call in one response) needs two distinct
+        // calls, which per-tool slots make expressible -- but offering every tool as an
+        // independently-fillable slot measurably increases how often the model calls one it did
+        // not need, including a call-ending tool mid-conversation (measured with a terminal-tool
+        // policy in the chat template active too: 15/15 conversations broken, 96 turns of
+        // misuse, vs. 0 with a single call). So it must stay opt-in, not the default.
+        //
+        // The explicit API opt-in is `parallel_tool_calls`. Some callers cannot add it to every
+        // multi-tool request (e.g. a fixed test harness whose request shape is out of scope to
+        // change), but already say the same thing in-band: the turn's own system/developer
+        // message instructs the model to call two tools together ("call X AND Y in the same
+        // turn"). That instruction is content the server already has to parse to run the turn
+        // at all, so honouring it is not a new signal, just reading the one that is there.
+        //
+        // This is a heuristic, not a structured field, so it is deliberately narrowed on two
+        // axes rather than one, because the two failure directions are not symmetric: missing
+        // a real multi-tool instruction just falls back to the (already safe) single-call
+        // default, but a false positive re-opens the exact regression this grammar exists to
+        // prevent -- a tool fired on a turn that did not need it.
+        //
+        //   1. SCOPED TO THIS TURN. Only the trailing system/developer messages -- the ones
+        //      appended after the last user message -- are read. Scanning the whole history
+        //      would let one multi-tool instruction anywhere in a long conversation stay
+        //      "latched on" for every later turn, which is not what the instruction means and
+        //      is exactly the kind of over-broad tool offering that causes the misuse this is
+        //      meant to avoid. Without a user-message boundary the turn cannot be scoped, so
+        //      the heuristic does not fire at all rather than falling back to scanning
+        //      everything.
+        //   2. ANCHORED TO A REAL TOOL. The message must name one of THIS request's own
+        //      offered tools, not just contain generic phrasing ("and", "same turn"). Tool
+        //      names are code identifiers, not English words, so an arbitrary reminder or
+        //      caller message cannot coincidentally satisfy this the way it could a phrase
+        //      alone -- checked against the multi-turn repro's own reminders and guidance
+        //      text, none of which name a tool, so none match.
+        let requests_parallel_in_message = to_json(Some(request.messages()))
+            .and_then(|m| m.as_array().cloned())
+            .and_then(|messages| {
+                let last_user = messages.iter().rposition(|m| {
+                    m.get("role").and_then(|r| r.as_str()) == Some("user")
+                })?;
+                Some(
+                    messages[last_user + 1..]
+                        .iter()
+                        .filter(|m| {
+                            matches!(
+                                m.get("role").and_then(|r| r.as_str()),
+                                Some("system") | Some("developer")
+                            )
+                        })
+                        .any(|m| {
+                            let text = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                            let lower = text.to_lowercase();
+                            lower.contains("same turn")
+                                && selected.iter().any(|name| text.contains(name.as_str()))
+                        }),
+                )
+            })
+            .unwrap_or(false);
+
+        let allow_parallel_calls =
+            request.parallel_tool_calls().unwrap_or(false) || requests_parallel_in_message;
+
+        // Whether the prompt was left inside an open thought channel. Not knowable from the
+        // request today, and assuming it is what erased the schema guarantee on the follow-up
+        // turn, so it stays off until a real signal exists.
+        let prompt_opened_thought = false;
+
         let Some(tag) = structural_tag::structural_tag_for_parser(
             parser,
-            &selected,
+            &selected_defs,
             content_schema.as_ref(),
             tools_mandatory,
-            true,
+            allow_reasoning,
+            allow_tool_only_turn,
+            allow_parallel_calls,
+            prompt_opened_thought,
         ) else {
             return;
         };
@@ -2166,19 +2251,31 @@ impl OpenAIPreprocessor {
         );
     }
 
-    /// Tool names from the request's `tools` array, in either OpenAI shape.
-    fn tool_names_from_value(tools: &serde_json::Value) -> Vec<String> {
+    /// Tool name + JSON-schema parameters from the request's `tools` array, in either OpenAI
+    /// shape. Parameters travel alongside the name so the structural tag can constrain a
+    /// required string argument's value (see `structural_tag::gemma4_tool_args_content`),
+    /// not just the tool name.
+    fn tool_definitions_from_value(
+        tools: &serde_json::Value,
+    ) -> Vec<dynamo_parsers::tool_calling::ToolDefinition> {
         tools
             .as_array()
             .map(|items| {
                 items
                     .iter()
                     .filter_map(|tool| {
-                        tool.get("function")
+                        let name = tool
+                            .get("function")
                             .and_then(|f| f.get("name"))
                             .or_else(|| tool.get("name"))
-                            .and_then(|n| n.as_str())
-                            .map(str::to_string)
+                            .and_then(|n| n.as_str())?
+                            .to_string();
+                        let parameters = tool
+                            .get("function")
+                            .and_then(|f| f.get("parameters"))
+                            .or_else(|| tool.get("parameters"))
+                            .cloned();
+                        Some(dynamo_parsers::tool_calling::ToolDefinition { name, parameters })
                     })
                     .collect()
             })

@@ -395,6 +395,10 @@ impl OAIChatLikeRequest for NvCreateChatCompletionRequest {
             .map(Value::from_serialize)
     }
 
+    fn parallel_tool_calls(&self) -> Option<bool> {
+        self.inner.parallel_tool_calls
+    }
+
     fn should_add_generation_prompt(&self) -> bool {
         // Using vLLM default behavior
         true

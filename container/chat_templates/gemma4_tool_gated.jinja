@@ -205,14 +205,48 @@
         {%- set loop_messages = messages[1:] -%}
     {%- endif -%}
     {%- if tools -%}
-        {#- Server-side tool gating: a tool list reads as a menu unless the default is
-            stated. Without this the model calls a tool on turns that should just
-            speak. Applies to every request, so no client change is needed. -#}
-        {{- '\nTOOL USE POLICY: Call a tool only when this turn clearly requires it. '
-            'Not calling any tool is the normal outcome and a plain reply is a complete '
-            'answer. Never call a tool merely because it is available, and never call one '
-            'to answer a question you can already answer from the conversation. If the '
-            'response format requires a JSON object, reply with that object and no tool call.\n' -}}
+        {#- Terminal-tool policy. Ending the call is the one tool action that cannot be
+            undone: if it fires while the caller is still talking, the call is dropped and
+            there is no recovery. Every other mistaken tool call costs a round trip, not
+            the call itself. So the bar is stated explicitly, and only for the call-ending
+            tool -- a blanket "call a tool only when clearly needed" policy was tried first
+            and rejected: it suppressed the legitimate tools too (measured: lookup, fetch
+            and transfer all stopped firing under it). Phrased in terms of what the tool
+            DOES, not a specific name, so it generalizes across whatever tools are actually
+            offered rather than hardcoding one deployment's naming. -#}
+        {{- '\nCALL-ENDING TOOLS: a tool that hangs up or ends the call may be used ONLY when '
+            'the caller has clearly finished -- they say goodbye, decline to continue, or ask '
+            'to be contacted another time. Silence, a short reply, "hello?", or no answer are '
+            'NOT endings: acknowledge and ask a brief question instead. When unsure, keep the '
+            'call open. Other tools are unaffected by this rule.\n' -}}
+        {#- Required-argument reminder, scoped by NAME to exactly the tools the grammar fix
+            targets (one required string property) -- not a generic "lookup tool" category.
+            A first attempt phrased this as a category ("the matching lookup tool") and it
+            measurably destabilized an unrelated zero-arg tool (fetch_details started
+            intermittently not firing, which never happened before that wording): the vague
+            phrase apparently bled into tools whose name merely sounds like retrieval. Naming
+            the exact tool avoids that generalization. -#}
+        {%- set ns_reqarg = namespace(items=[]) -%}
+        {%- for tool in tools -%}
+            {%- set params = tool['function']['parameters'] -%}
+            {%- if params and params['required'] and params['properties'] -%}
+                {%- for req_key in params['required'] -%}
+                    {%- set prop = params['properties'].get(req_key) -%}
+                    {%- if prop and (prop['type'] | lower) == 'string' -%}
+                        {%- set ns_reqarg.items = ns_reqarg.items + [
+                            {'tool': tool['function']['name'], 'arg': req_key}] -%}
+                    {%- endif -%}
+                {%- endfor -%}
+            {%- endif -%}
+        {%- endfor -%}
+        {%- if ns_reqarg.items -%}
+            {{- '\n' -}}
+            {%- for item in ns_reqarg.items -%}
+                {{- (item.tool ~ "'s `" ~ item.arg ~ '` must be a real, specific value every '
+                    ~ 'time ' ~ item.tool ~ ' is called -- call it whenever the caller\'s '
+                    ~ 'request needs it, and never leave `' ~ item.arg ~ '` empty.\n') -}}
+            {%- endfor -%}
+        {%- endif -%}
         {%- for tool in tools %}
             {{- '<|tool>' -}}
             {{- format_function_declaration(tool) | trim -}}

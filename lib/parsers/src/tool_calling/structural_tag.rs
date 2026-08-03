@@ -20,8 +20,14 @@
 //! the tag body is left unconstrained: the wrapper and the tool *name* are
 //! constrained, the arguments are not. (xgrammar ships a `gemma_4` template but
 //! leaves it unregistered for exactly this reason.)
+//!
+//! One exception: a REQUIRED argument must not be omitted or emitted empty (production's
+//! `EMPTY_REQUIRED_ARG` -- the model calls `lookup_info{}` or `lookup_info{query:<|"|><|"|>}`
+//! instead of filling `query` in). See `gemma4_tool_args_content`.
 
 use serde_json::{Value, json};
+
+use super::ToolDefinition;
 
 /// Gemma 4 channel markers, as they appear in decoded text.
 pub const GEMMA4_TOOL_CALL_BEGIN: &str = "<|tool_call>call:";
@@ -29,12 +35,236 @@ pub const GEMMA4_TOOL_CALL_END: &str = "<tool_call|>";
 pub const GEMMA4_TOOL_CALL_TRIGGER: &str = "<|tool_call>";
 pub const GEMMA4_REASONING_END: &str = "<channel|>";
 pub const GEMMA4_THOUGHT_BEGIN: &str = "<|channel>thought\n";
+/// Gemma 4's string-argument delimiter: `key:<|"|>value<|"|>`.
+const GEMMA4_STRING_DELIM: &str = "<|\"|>";
 
-fn gemma4_tool_tag(name: &str) -> Value {
+/// Names of this tool's top-level REQUIRED properties typed `string`.
+fn required_nonempty_string_keys(parameters: Option<&Value>) -> Vec<String> {
+    let Some(params) = parameters else {
+        return Vec::new();
+    };
+    let Some(required) = params.get("required").and_then(|r| r.as_array()) else {
+        return Vec::new();
+    };
+    let Some(properties) = params.get("properties").and_then(|p| p.as_object()) else {
+        return Vec::new();
+    };
+    required
+        .iter()
+        .filter_map(|r| r.as_str())
+        .filter(|key| {
+            properties
+                .get(*key)
+                .and_then(|p| p.get("type"))
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t.eq_ignore_ascii_case("string"))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Above this many top-level properties, permuting required×optional key combinations is not
+/// worth the branch-count blow-up -- fall back to the looser dispatch patch instead. Real tools
+/// here top out at 2 (`transfer_call`), so this is generous headroom, not a tight fit.
+const MAX_PROPS_FOR_EXACT_ARGS_GRAMMAR: usize = 4;
+
+/// A `key:value` slot format for a `string`/`integer`/`number`/`boolean` property, or `None` for
+/// anything else (object, array, unspecified) -- those are out of scope for exact enforcement;
+/// see `exact_args_grammar`.
+fn simple_value_format(prop_schema: &Value, required: bool) -> Option<Value> {
+    let ty = prop_schema.get("type").and_then(|t| t.as_str())?;
+    Some(if ty.eq_ignore_ascii_case("string") {
+        json!({
+            "type": "sequence",
+            "elements": [
+                {"type": "const_string", "value": GEMMA4_STRING_DELIM},
+                // `+` (required, non-empty) vs `*` (optional, may be empty) -- an OPTIONAL
+                // string argument emitted empty is not the reported failure and not this fix's
+                // job; only a REQUIRED one must never be empty.
+                {"type": "regex", "pattern": if required { "[\\s\\S]+" } else { "[\\s\\S]*" }},
+                {"type": "const_string", "value": GEMMA4_STRING_DELIM},
+            ],
+        })
+    } else if ty.eq_ignore_ascii_case("integer") || ty.eq_ignore_ascii_case("number") {
+        json!({"type": "regex", "pattern": "-?[0-9]+(\\.[0-9]+)?"})
+    } else if ty.eq_ignore_ascii_case("boolean") {
+        json!({"type": "or", "elements": [
+            {"type": "const_string", "value": "true"},
+            {"type": "const_string", "value": "false"},
+        ]})
+    } else {
+        return None;
+    })
+}
+
+/// All permutations of `items`, as index-order vectors. `items.len()` is capped by the caller
+/// (`MAX_PROPS_FOR_EXACT_ARGS_GRAMMAR`), so this never runs on more than a handful of elements.
+fn permutations(items: &[usize]) -> Vec<Vec<usize>> {
+    if items.len() <= 1 {
+        return vec![items.to_vec()];
+    }
+    let mut out = Vec::new();
+    for (i, &head) in items.iter().enumerate() {
+        let mut rest = items.to_vec();
+        rest.remove(i);
+        for mut perm in permutations(&rest) {
+            perm.insert(0, head);
+            out.push(perm);
+        }
+    }
+    out
+}
+
+/// Exact grammar for a tool's `{key:value,...}` body: every REQUIRED key is guaranteed to
+/// appear (with a well-formed, non-empty value if it's a string), every optional key may or may
+/// not appear, keys may arrive in any order the model picks (permuted, not just one fixed
+/// order) -- so both observed shapes of `EMPTY_REQUIRED_ARG` (`lookup_info{}` with the key
+/// omitted entirely, and `lookup_info{query:<|"|><|"|>}` with it present but empty) become
+/// unreachable strings, not just less likely ones.
+///
+/// `None` when the schema doesn't fit: too many properties, or any property typed something
+/// other than string/integer/number/boolean (object/array nesting is a real shape here --
+/// `transfer_call.fields` -- and not attempted). The caller falls back to a looser guarantee
+/// for those; see `gemma4_tool_args_content`.
+fn exact_args_grammar(properties: &serde_json::Map<String, Value>, required: &[String]) -> Option<Value> {
+    if properties.is_empty() || properties.len() > MAX_PROPS_FOR_EXACT_ARGS_GRAMMAR {
+        return None;
+    }
+    let keys: Vec<&String> = properties.keys().collect();
+    let mut slots = Vec::with_capacity(keys.len());
+    for key in &keys {
+        let is_required = required.iter().any(|r| r == *key);
+        let value_format = simple_value_format(&properties[*key], is_required)?;
+        slots.push((key.as_str(), value_format, is_required));
+    }
+
+    let required_idx: Vec<usize> = (0..slots.len()).filter(|&i| slots[i].2).collect();
+    let optional_idx: Vec<usize> = (0..slots.len()).filter(|&i| !slots[i].2).collect();
+
+    let mut branches = Vec::new();
+    for mask in 0u32..(1 << optional_idx.len()) {
+        let mut chosen = required_idx.clone();
+        for (bit, &oi) in optional_idx.iter().enumerate() {
+            if mask & (1 << bit) != 0 {
+                chosen.push(oi);
+            }
+        }
+        for perm in permutations(&chosen) {
+            if perm.is_empty() {
+                branches.push(json!({"type": "const_string", "value": ""}));
+                continue;
+            }
+            let mut elements = Vec::with_capacity(perm.len() * 2 - 1);
+            for (i, &idx) in perm.iter().enumerate() {
+                if i > 0 {
+                    elements.push(json!({"type": "const_string", "value": ","}));
+                }
+                let (key, value_format, _) = &slots[idx];
+                elements.push(json!({
+                    "type": "sequence",
+                    "elements": [
+                        {"type": "const_string", "value": format!("{key}:")},
+                        value_format,
+                    ],
+                }));
+            }
+            branches.push(json!({"type": "sequence", "elements": elements}));
+        }
+    }
+
+    // The parser's regex requires a literal `{...}` wrapper right after the function name
+    // (`call:name{args}`) -- with the free-form `any_text` body this came along for free
+    // since the model always writes it as ordinary text; this exact grammar replaces that
+    // body outright, so the braces must be put back explicitly or the call becomes invisible
+    // to the parser (regex miss -> silently dropped as "markup present, suppressing") even
+    // though the grammar itself was satisfied.
+    let body = if branches.len() == 1 {
+        branches.into_iter().next().unwrap()
+    } else {
+        json!({"type": "or", "elements": branches})
+    };
+
+    Some(json!({
+        "type": "sequence",
+        "elements": [
+            {"type": "const_string", "value": "{"},
+            body,
+            {"type": "const_string", "value": "}"},
+        ],
+    }))
+}
+
+/// Content grammar for one tool call's `{key:value,...}` body.
+///
+/// Free-form as always (arguments are not JSON; see the module docs) UNLESS the tool has a
+/// REQUIRED argument to protect. Two tiers, from strongest guarantee to weakest:
+///
+/// 1. `exact_args_grammar` — when every property is simple (string/integer/number/boolean) and
+///    there are few enough to permute, the body grammar exactly matches the schema: required
+///    keys MUST appear (non-empty if string), optional keys may or may not, any order. Both
+///    observed shapes of `EMPTY_REQUIRED_ARG` become unreachable strings.
+/// 2. Otherwise, if there is still a required STRING property (e.g. `transfer_call.summary`
+///    alongside the `fields` object this fix does not attempt to constrain): a `dispatch` rule
+///    that reacts once the model writes `key:<|"|>` for that key and requires at least one
+///    character before the closing delimiter. This does NOT force the key to appear at all —
+///    only that model's known real failure (an empty value) becomes unreachable once it does.
+/// 3. No required string property at all: unchanged `any_text`, as before this fix.
+fn gemma4_tool_args_content(parameters: Option<&Value>) -> Value {
+    let any_text_fallback = || json!({"type": "any_text", "excludes": []});
+    let Some(params) = parameters else {
+        return any_text_fallback();
+    };
+
+    if let Some(properties) = params.get("properties").and_then(|p| p.as_object()) {
+        let required: Vec<String> = params
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+            .unwrap_or_default();
+        if let Some(exact) = exact_args_grammar(properties, &required) {
+            return exact;
+        }
+    }
+
+    let required_strings = required_nonempty_string_keys(parameters);
+    if required_strings.is_empty() {
+        return any_text_fallback();
+    }
+
+    let nonempty_value = json!({
+        "type": "sequence",
+        "elements": [
+            {"type": "regex", "pattern": "[\\s\\S]+"},
+            {"type": "const_string", "value": GEMMA4_STRING_DELIM},
+        ],
+    });
+
+    // Two trigger spellings per key (no space / one space after `:`) since both are legal
+    // per the parser's `skip_whitespace` and observed in practice; anything wider (multiple
+    // spaces, a newline) falls through to the free-form default, same as before this change.
+    let rules: Vec<Value> = required_strings
+        .iter()
+        .flat_map(|key| {
+            [
+                json!([format!("{key}:{GEMMA4_STRING_DELIM}"), nonempty_value]),
+                json!([format!("{key}: {GEMMA4_STRING_DELIM}"), nonempty_value]),
+            ]
+        })
+        .collect();
+
+    json!({
+        "type": "dispatch",
+        "rules": rules,
+        "loop": true,
+        "excludes": [],
+    })
+}
+
+fn gemma4_tool_tag(tool: &ToolDefinition) -> Value {
     json!({
         "type": "tag",
-        "begin": format!("{GEMMA4_TOOL_CALL_BEGIN}{name}"),
-        "content": {"type": "any_text", "excludes": []},
+        "begin": format!("{GEMMA4_TOOL_CALL_BEGIN}{}", tool.name),
+        "content": gemma4_tool_args_content(tool.parameters.as_ref()),
         "end": GEMMA4_TOOL_CALL_END,
     })
 }
@@ -62,21 +292,21 @@ fn gemma4_tool_tag(name: &str) -> Value {
 ///
 /// Caveat: the slots are ordered, so calls arrive in the order the tools were declared in the
 /// request. The caller controls that order; permuting would cost one branch per ordering.
-fn gemma4_tool_calls(tool_names: &[String], at_least_one: bool) -> Value {
-    let optional = |name: &String| json!({"type": "optional", "content": gemma4_tool_tag(name)});
+fn gemma4_tool_calls(tools: &[ToolDefinition], at_least_one: bool) -> Value {
+    let optional = |tool: &ToolDefinition| json!({"type": "optional", "content": gemma4_tool_tag(tool)});
 
     if !at_least_one {
         return json!({
             "type": "sequence",
-            "elements": tool_names.iter().map(optional).collect::<Vec<_>>(),
+            "elements": tools.iter().map(optional).collect::<Vec<_>>(),
         });
     }
 
-    let branches: Vec<Value> = (0..tool_names.len())
+    let branches: Vec<Value> = (0..tools.len())
         .map(|i| {
-            let mut elements: Vec<Value> = tool_names[..i].iter().map(optional).collect();
-            elements.push(gemma4_tool_tag(&tool_names[i])); // required => branch is non-empty
-            elements.extend(tool_names[i + 1..].iter().map(optional));
+            let mut elements: Vec<Value> = tools[..i].iter().map(optional).collect();
+            elements.push(gemma4_tool_tag(&tools[i])); // required => branch is non-empty
+            elements.extend(tools[i + 1..].iter().map(optional));
             json!({"type": "sequence", "elements": elements})
         })
         .collect();
@@ -91,10 +321,10 @@ fn gemma4_tool_calls(tool_names: &[String], at_least_one: bool) -> Value {
 /// Exactly one tool call, chosen from the offered tools. `stop_after_first` is what makes the
 /// second `<|tool_call>` unsamplable, so neither a repetition loop nor an unrequested extra tool
 /// can follow the first call.
-fn gemma4_single_tool_call(tool_names: &[String]) -> Value {
+fn gemma4_single_tool_call(tools: &[ToolDefinition]) -> Value {
     json!({
         "type": "tags_with_separator",
-        "tags": tool_names.iter().map(|n| gemma4_tool_tag(n)).collect::<Vec<_>>(),
+        "tags": tools.iter().map(gemma4_tool_tag).collect::<Vec<_>>(),
         "separator": "",
         "at_least_one": true,
         "stop_after_first": true,
@@ -103,7 +333,7 @@ fn gemma4_single_tool_call(tool_names: &[String]) -> Value {
 
 /// Build the Gemma 4 tool-call structural tag.
 ///
-/// * `tool_names` — tools the model may call. Empty returns `None`.
+/// * `tools` — tools the model may call, name + JSON-schema parameters. Empty returns `None`.
 /// * `content_schema` — the caller's `response_format` JSON schema, if any. When
 ///   present it becomes a branch of the union so the schema guarantee survives.
 /// * `tools_mandatory` — `true` for `tool_choice: "required"` or a named choice:
@@ -122,7 +352,7 @@ fn gemma4_single_tool_call(tool_names: &[String]) -> Value {
 /// * `prompt_opened_thought` — the chat template left the prompt inside an open thought
 ///   channel, so the completion emits only the closer. Off unless known; see below.
 pub fn gemma4_structural_tag(
-    tool_names: &[String],
+    tools: &[ToolDefinition],
     content_schema: Option<&Value>,
     tools_mandatory: bool,
     allow_reasoning: bool,
@@ -130,7 +360,7 @@ pub fn gemma4_structural_tag(
     allow_parallel_calls: bool,
     prompt_opened_thought: bool,
 ) -> Option<Value> {
-    if tool_names.is_empty() {
+    if tools.is_empty() {
         return None;
     }
 
@@ -158,11 +388,11 @@ pub fn gemma4_structural_tag(
     // tool list or the schema.
     let one_tool_call = |at_least_one: bool| {
         if allow_parallel_calls {
-            gemma4_tool_calls(tool_names, at_least_one)
+            gemma4_tool_calls(tools, at_least_one)
         } else if at_least_one {
-            gemma4_single_tool_call(tool_names)
+            gemma4_single_tool_call(tools)
         } else {
-            json!({"type": "optional", "content": gemma4_single_tool_call(tool_names)})
+            json!({"type": "optional", "content": gemma4_single_tool_call(tools)})
         }
     };
 
@@ -205,7 +435,7 @@ pub fn gemma4_structural_tag(
         // about batching independent calls, not about what a single demanded call may do.
         None => {
             if tools_mandatory {
-                gemma4_single_tool_call(tool_names)
+                gemma4_single_tool_call(tools)
             } else {
                 one_tool_call(true)
             }
@@ -263,7 +493,7 @@ pub fn parser_has_structural_tag(parser: Option<&str>) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub fn structural_tag_for_parser(
     parser: Option<&str>,
-    tool_names: &[String],
+    tools: &[ToolDefinition],
     content_schema: Option<&Value>,
     tools_mandatory: bool,
     allow_reasoning: bool,
@@ -275,7 +505,7 @@ pub fn structural_tag_for_parser(
         return None;
     }
     gemma4_structural_tag(
-        tool_names,
+        tools,
         content_schema,
         tools_mandatory,
         allow_reasoning,
@@ -289,8 +519,15 @@ pub fn structural_tag_for_parser(
 mod tests {
     use super::*;
 
+    fn tools() -> Vec<ToolDefinition> {
+        vec![
+            ToolDefinition { name: "fetch_seller_details".to_string(), parameters: None },
+            ToolDefinition { name: "hangup_call".to_string(), parameters: None },
+        ]
+    }
+
     fn names() -> Vec<String> {
-        vec!["fetch_seller_details".to_string(), "hangup_call".to_string()]
+        tools().into_iter().map(|t| t.name).collect()
     }
 
     fn schema() -> Value {
@@ -325,7 +562,7 @@ mod tests {
         // Envelope first, tool slots after: a tool-only turn is silence for a json_schema
         // caller, so it is not offered unless the caller asks for it.
         let tag =
-            gemma4_structural_tag(&names(), Some(&schema()), false, false, false, false, false).unwrap();
+            gemma4_structural_tag(&tools(), Some(&schema()), false, false, false, false, false).unwrap();
         assert_eq!(tag["type"], "structural_tag");
         assert_eq!(tag["format"]["type"], "sequence");
         assert_eq!(tag["format"]["elements"][0]["type"], "json_schema");
@@ -339,7 +576,7 @@ mod tests {
     #[test]
     fn a_tool_only_turn_is_opt_in() {
         let tag =
-            gemma4_structural_tag(&names(), Some(&schema()), false, false, true, false, false).unwrap();
+            gemma4_structural_tag(&tools(), Some(&schema()), false, false, true, false, false).unwrap();
         assert_eq!(tag["format"]["type"], "or");
         assert_no_repeatable_branch(&tag);
     }
@@ -347,7 +584,7 @@ mod tests {
     #[test]
     fn every_offered_tool_is_reachable_as_the_one_call() {
         // Any offered tool may be THE call for the turn, and only one call is possible.
-        let tag = gemma4_structural_tag(&names(), Some(&schema()), false, false, false, false, false).unwrap();
+        let tag = gemma4_structural_tag(&tools(), Some(&schema()), false, false, false, false, false).unwrap();
         let branch = &tag["format"]["elements"][1]["content"];
         assert_eq!(branch["stop_after_first"], true);
         let tags = branch["tags"].as_array().unwrap();
@@ -363,7 +600,7 @@ mod tests {
         // lets the model write content and end the turn with a special token the grammar
         // cannot mask, leaving the demanded call unmade. Forced choice therefore admits
         // tool calls only — which is also what response_format means in OpenAI's API.
-        let tag = gemma4_structural_tag(&names(), Some(&schema()), true, false, false, false, false).unwrap();
+        let tag = gemma4_structural_tag(&tools(), Some(&schema()), true, false, false, false, false).unwrap();
         // tool calls only, pinned to exactly one
         assert_eq!(tag["format"]["type"], "tags_with_separator");
         assert_eq!(tag["format"]["stop_after_first"], true);
@@ -371,13 +608,13 @@ mod tests {
 
     #[test]
     fn without_schema_the_native_tag_is_used_alone() {
-        let tag = gemma4_structural_tag(&names(), None, true, false, false, false, false).unwrap();
+        let tag = gemma4_structural_tag(&tools(), None, true, false, false, false, false).unwrap();
         assert_eq!(tag["format"]["type"], "tags_with_separator");
     }
 
     #[test]
     fn reasoning_prefix_is_optional_and_wraps_the_body() {
-        let tag = gemma4_structural_tag(&names(), None, false, true, false, false, false).unwrap();
+        let tag = gemma4_structural_tag(&tools(), None, false, true, false, false, false).unwrap();
         assert_eq!(tag["format"]["type"], "sequence");
         assert_eq!(tag["format"]["elements"][0]["type"], "optional");
         assert_eq!(
@@ -388,7 +625,7 @@ mod tests {
 
     #[test]
     fn tool_names_are_constrained_but_arguments_are_not() {
-        let tag = gemma4_structural_tag(&names(), None, false, false, false, false, false).unwrap();
+        let tag = gemma4_structural_tag(&tools(), None, false, false, false, false, false).unwrap();
         // no schema -> tool calls only, as an `or` of per-tool branches; branch 0 starts with
         // the first tool required.
         let first = &tag["format"]["tags"][0];
@@ -404,7 +641,7 @@ mod tests {
         // and end the turn. Forced and unforced turns both constrain it.
         for mandatory in [true, false] {
             let tag =
-                gemma4_structural_tag(&names(), None, mandatory, true, false, false, false).unwrap();
+                gemma4_structural_tag(&tools(), None, mandatory, true, false, false, false).unwrap();
             assert_eq!(
                 tag["format"]["elements"][0]["content"]["begin"],
                 GEMMA4_THOUGHT_BEGIN,
@@ -417,7 +654,7 @@ mod tests {
     fn prompt_opened_thought_is_opt_in() {
         // The continuation case is real, but only correct when the prompt genuinely left the
         // channel open — assuming it on every request is what broke the tool follow-up.
-        let tag = gemma4_structural_tag(&names(), None, false, true, false, false, true).unwrap();
+        let tag = gemma4_structural_tag(&tools(), None, false, true, false, false, true).unwrap();
         assert_eq!(tag["format"]["elements"][0]["content"]["begin"], "");
     }
 
@@ -430,7 +667,7 @@ mod tests {
             for tool_only in [true, false] {
                 for sch in [Some(schema()), None] {
                     let tag = gemma4_structural_tag(
-                        &names(), sch.as_ref(), mandatory, false, tool_only, false, false,
+                        &tools(), sch.as_ref(), mandatory, false, tool_only, false, false,
                     )
                     .unwrap();
                     assert_no_repeatable_branch(&tag);
@@ -443,7 +680,7 @@ mod tests {
     fn allow_parallel_calls_is_opt_in_and_still_forbids_repetition() {
         // Default: pinned to one call, so a multi-tool turn is unreachable.
         let single = gemma4_structural_tag(
-            &names(), Some(&schema()), false, false, false, false, false,
+            &tools(), Some(&schema()), false, false, false, false, false,
         )
         .unwrap();
         let dumped = serde_json::to_string(&single).unwrap();
@@ -451,7 +688,7 @@ mod tests {
 
         // Opted in: distinct tools become reachable together...
         let parallel = gemma4_structural_tag(
-            &names(), Some(&schema()), false, false, false, true, false,
+            &tools(), Some(&schema()), false, false, false, true, false,
         )
         .unwrap();
         let slots = parallel["format"]["elements"][1]["elements"].as_array().unwrap();
@@ -466,11 +703,178 @@ mod tests {
 
         // A forced choice ignores allow_parallel_calls -- it is still pinned to one call.
         let forced = gemma4_structural_tag(
-            &names(), Some(&schema()), true, false, false, true, false,
+            &tools(), Some(&schema()), true, false, false, true, false,
         )
         .unwrap();
         assert_eq!(forced["format"]["type"], "tags_with_separator");
         assert_eq!(forced["format"]["stop_after_first"], true);
+    }
+
+    fn lookup_tool_with_required_query() -> ToolDefinition {
+        ToolDefinition {
+            name: "lookup_info".to_string(),
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            })),
+        }
+    }
+
+    /// Every string in `strings` must be a reachable prefix-consistent match against `format`'s
+    /// dumped shape: since these tests don't have an xgrammar matcher available, they instead
+    /// walk the JSON tree checking that at least one branch's literal path spells out `s`. This
+    /// is the same "does this shape survive in the tree" style as `assert_no_repeatable_branch`.
+    fn any_branch_contains(format: &Value, needle: &str) -> bool {
+        serde_json::to_string(format).unwrap().contains(needle)
+    }
+
+    #[test]
+    fn simple_single_required_string_arg_gets_the_exact_grammar() {
+        // `lookup_info`'s real shape (one required string property, nothing else) hits the
+        // strongest tier: the grammar for the whole body is just `query:<|"|>` + 1+ chars +
+        // `<|"|>`, so BOTH observed EMPTY_REQUIRED_ARG shapes are unreachable strings --
+        // `lookup_info{}` (key omitted) and `lookup_info{query:<|"|><|"|>}` (key present, empty).
+        let content = gemma4_tool_args_content(lookup_tool_with_required_query().parameters.as_ref());
+        assert_eq!(content["type"], "sequence");
+        let dumped = serde_json::to_string(&content).unwrap();
+        assert!(dumped.contains("\"query:\""), "required key must be a literal, not optional: {dumped}");
+        // GEMMA4_STRING_DELIM's `"` comes back JSON-escaped (`\"`) in the dumped text.
+        assert!(dumped.contains("<|\\\"|>"), "string delimiter must appear in the value format: {dumped}");
+        // one_or_more, never zero_or_more -- the empty string must not be a legal value.
+        assert!(any_branch_contains(&content, "[\\\\s\\\\S]+"));
+        assert!(!dumped.contains("any_text"), "must not fall back to the unconstrained body: {dumped}");
+    }
+
+    #[test]
+    fn required_and_optional_mix_permutes_but_keeps_required_mandatory() {
+        // Two required (string, integer) + one optional (string): every accepted branch must
+        // contain both required keys; branches differ only in order and whether `note` appears.
+        let mixed = json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "count": {"type": "integer"},
+                "note": {"type": "string"},
+            },
+            "required": ["name", "count"],
+        });
+        let content = gemma4_tool_args_content(Some(&mixed));
+        // Whole body is wrapped `{ <or-of-branches> }` so the call still parses as `name{args}`.
+        assert_eq!(content["type"], "sequence");
+        assert_eq!(content["elements"][0]["value"], "{");
+        assert_eq!(content["elements"][2]["value"], "}");
+        let or = &content["elements"][1];
+        assert_eq!(or["type"], "or");
+        let branches = or["elements"].as_array().unwrap();
+        assert!(branches.len() > 1, "order + optional-subset should produce more than one branch");
+        for branch in branches {
+            let dumped = serde_json::to_string(branch).unwrap();
+            assert!(dumped.contains("\"name:\""), "every branch must require `name`: {dumped}");
+            assert!(dumped.contains("\"count:\""), "every branch must require `count`: {dumped}");
+        }
+        // `note` appears in at least one branch (optional = sometimes present)...
+        assert!(branches.iter().any(|b| serde_json::to_string(b).unwrap().contains("\"note:\"")));
+        // ...but not in every branch (optional = not mandatory).
+        assert!(branches.iter().any(|b| !serde_json::to_string(b).unwrap().contains("\"note:\"")));
+    }
+
+    #[test]
+    fn complex_schema_falls_back_to_the_dispatch_patch() {
+        // `transfer_call`'s real shape: a required STRING (`summary`) alongside a required
+        // OBJECT (`fields`) the exact-grammar tier does not attempt. Falls back to tier 2 --
+        // weaker (does not force `summary` to appear) but still closes the empty-value case
+        // once it does.
+        let transfer_like = json!({
+            "type": "object",
+            "properties": {
+                "fields": {"type": "object", "properties": {"a": {"type": "string"}}},
+                "summary": {"type": "string"},
+            },
+            "required": ["fields", "summary"],
+        });
+        let content = gemma4_tool_args_content(Some(&transfer_like));
+        assert_eq!(content["type"], "dispatch");
+        let rules = content["rules"].as_array().unwrap();
+        assert!(rules.iter().any(|r| r[0] == "summary:<|\"|>"));
+        assert!(!rules.iter().any(|r| r[0].as_str().unwrap_or_default().starts_with("fields:")));
+    }
+
+    #[test]
+    fn too_many_properties_falls_back_to_the_dispatch_patch() {
+        let many = json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "string"}, "b": {"type": "string"}, "c": {"type": "string"},
+                "d": {"type": "string"}, "e": {"type": "string"},
+            },
+            "required": ["a"],
+        });
+        assert_eq!(gemma4_tool_args_content(Some(&many))["type"], "dispatch");
+    }
+
+    #[test]
+    fn tool_without_required_string_args_keeps_any_text() {
+        // No schema at all, or a schema with no required string property: unchanged from
+        // before this fix, so nothing about existing (schema-less) tools regresses.
+        assert_eq!(gemma4_tool_args_content(None), json!({"type": "any_text", "excludes": []}));
+
+        // Zero-arg tools (fetch_details, transfer_to_agent, fetch_seller_details in the real
+        // test surface) have an empty `properties` object -- must stay any_text too, since
+        // whether the model calls a zero-arg tool at all is a judgment question this fix does
+        // not touch, only what's inside a call's arguments once made.
+        let zero_arg = json!({"type": "object", "properties": {}, "required": []});
+        assert_eq!(
+            gemma4_tool_args_content(Some(&zero_arg)),
+            json!({"type": "any_text", "excludes": []})
+        );
+
+        let optional_only = json!({
+            "type": "object",
+            "properties": {"note": {"type": "string"}},
+            "required": [],
+        });
+        // All-optional still gets the exact tier (it must permit, but not require, `note`) --
+        // confirm the empty body is still one of the reachable branches.
+        let content = gemma4_tool_args_content(Some(&optional_only));
+        assert!(
+            any_branch_contains(&content, "\"\""),
+            "an all-optional schema must still accept an empty body: {content}"
+        );
+
+        let required_non_string = json!({
+            "type": "object",
+            "properties": {"count": {"type": "integer"}},
+            "required": ["count"],
+        });
+        // Required but non-string: exact tier still applies (integers get a numeric regex, not
+        // an emptiness concern), so this is no longer `any_text` either -- only a genuinely
+        // schema-less tool, or one this fix's tiers both decline, keeps the old fallback.
+        assert_ne!(
+            gemma4_tool_args_content(Some(&required_non_string))["type"],
+            "any_text"
+        );
+    }
+
+    #[test]
+    fn tool_tag_threads_the_schema_into_its_content() {
+        // End to end from `ToolDefinition` through `gemma4_tool_tag`, not just the helper.
+        let tag = gemma4_tool_tag(&lookup_tool_with_required_query());
+        assert_eq!(tag["begin"], "<|tool_call>call:lookup_info");
+        assert_eq!(tag["content"]["type"], "sequence");
+    }
+
+    #[test]
+    fn exact_grammar_wraps_the_body_in_literal_braces() {
+        // The parser's regex requires `call:name{args}` -- literal braces right after the
+        // name and right before the end tag. The exact-grammar tier fully replaces the
+        // free-form body (unlike the dispatch fallback, where braces ride along as ordinary
+        // text), so it must put them back explicitly or a grammar-valid completion becomes
+        // invisible to the parser (regex miss -> silently dropped).
+        let content = gemma4_tool_args_content(lookup_tool_with_required_query().parameters.as_ref());
+        assert_eq!(content["type"], "sequence");
+        assert_eq!(content["elements"][0], json!({"type": "const_string", "value": "{"}));
+        assert_eq!(content["elements"][2], json!({"type": "const_string", "value": "}"}));
     }
 
     #[test]
@@ -480,7 +884,7 @@ mod tests {
         assert!(!parser_has_structural_tag(Some("hermes")));
         assert!(!parser_has_structural_tag(None));
         assert!(
-            structural_tag_for_parser(Some("hermes"), &names(), None, false, false, false, false, false).is_none()
+            structural_tag_for_parser(Some("hermes"), &tools(), None, false, false, false, false, false).is_none()
         );
     }
 }

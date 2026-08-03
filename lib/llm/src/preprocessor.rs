@@ -2095,8 +2095,8 @@ impl OpenAIPreprocessor {
         let Some(tools) = to_json(request.tools()) else {
             return;
         };
-        let tool_names = Self::tool_names_from_value(&tools);
-        if tool_names.is_empty() {
+        let tool_defs = Self::tool_definitions_from_value(&tools);
+        if tool_defs.is_empty() {
             return;
         }
 
@@ -2114,13 +2114,14 @@ impl OpenAIPreprocessor {
             .map(str::to_string);
         let tools_mandatory = choice_str == Some("required") || named_tool.is_some();
 
-        let selected: Vec<String> = match &named_tool {
-            Some(name) => tool_names.iter().filter(|n| *n == name).cloned().collect(),
-            None => tool_names,
+        let selected_defs: Vec<dynamo_parsers::tool_calling::ToolDefinition> = match &named_tool {
+            Some(name) => tool_defs.into_iter().filter(|t| &t.name == name).collect(),
+            None => tool_defs,
         };
-        if selected.is_empty() {
+        if selected_defs.is_empty() {
             return;
         }
+        let selected: Vec<String> = selected_defs.iter().map(|t| t.name.clone()).collect();
 
         // The content constraint worth keeping: an explicit json_schema, or json_object,
         // which is "any JSON object" and would otherwise fall back to a bare JSON grammar
@@ -2224,7 +2225,7 @@ impl OpenAIPreprocessor {
 
         let Some(tag) = structural_tag::structural_tag_for_parser(
             parser,
-            &selected,
+            &selected_defs,
             content_schema.as_ref(),
             tools_mandatory,
             allow_reasoning,
@@ -2250,19 +2251,31 @@ impl OpenAIPreprocessor {
         );
     }
 
-    /// Tool names from the request's `tools` array, in either OpenAI shape.
-    fn tool_names_from_value(tools: &serde_json::Value) -> Vec<String> {
+    /// Tool name + JSON-schema parameters from the request's `tools` array, in either OpenAI
+    /// shape. Parameters travel alongside the name so the structural tag can constrain a
+    /// required string argument's value (see `structural_tag::gemma4_tool_args_content`),
+    /// not just the tool name.
+    fn tool_definitions_from_value(
+        tools: &serde_json::Value,
+    ) -> Vec<dynamo_parsers::tool_calling::ToolDefinition> {
         tools
             .as_array()
             .map(|items| {
                 items
                     .iter()
                     .filter_map(|tool| {
-                        tool.get("function")
+                        let name = tool
+                            .get("function")
                             .and_then(|f| f.get("name"))
                             .or_else(|| tool.get("name"))
-                            .and_then(|n| n.as_str())
-                            .map(str::to_string)
+                            .and_then(|n| n.as_str())?
+                            .to_string();
+                        let parameters = tool
+                            .get("function")
+                            .and_then(|f| f.get("parameters"))
+                            .or_else(|| tool.get("parameters"))
+                            .cloned();
+                        Some(dynamo_parsers::tool_calling::ToolDefinition { name, parameters })
                     })
                     .collect()
             })

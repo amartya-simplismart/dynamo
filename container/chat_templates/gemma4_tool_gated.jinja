@@ -219,6 +219,34 @@
             'to be contacted another time. Silence, a short reply, "hello?", or no answer are '
             'NOT endings: acknowledge and ask a brief question instead. When unsure, keep the '
             'call open. Other tools are unaffected by this rule.\n' -}}
+        {#- Required-argument reminder, scoped by NAME to exactly the tools the grammar fix
+            targets (one required string property) -- not a generic "lookup tool" category.
+            A first attempt phrased this as a category ("the matching lookup tool") and it
+            measurably destabilized an unrelated zero-arg tool (fetch_details started
+            intermittently not firing, which never happened before that wording): the vague
+            phrase apparently bled into tools whose name merely sounds like retrieval. Naming
+            the exact tool avoids that generalization. -#}
+        {%- set ns_reqarg = namespace(items=[]) -%}
+        {%- for tool in tools -%}
+            {%- set params = tool['function']['parameters'] -%}
+            {%- if params and params['required'] and params['properties'] -%}
+                {%- for req_key in params['required'] -%}
+                    {%- set prop = params['properties'].get(req_key) -%}
+                    {%- if prop and (prop['type'] | lower) == 'string' -%}
+                        {%- set ns_reqarg.items = ns_reqarg.items + [
+                            {'tool': tool['function']['name'], 'arg': req_key}] -%}
+                    {%- endif -%}
+                {%- endfor -%}
+            {%- endif -%}
+        {%- endfor -%}
+        {%- if ns_reqarg.items -%}
+            {{- '\n' -}}
+            {%- for item in ns_reqarg.items -%}
+                {{- (item.tool ~ "'s `" ~ item.arg ~ '` must be a real, specific value every '
+                    ~ 'time ' ~ item.tool ~ ' is called -- call it whenever the caller\'s '
+                    ~ 'request needs it, and never leave `' ~ item.arg ~ '` empty.\n') -}}
+            {%- endfor -%}
+        {%- endif -%}
         {%- for tool in tools %}
             {{- '<|tool>' -}}
             {{- format_function_declaration(tool) | trim -}}
